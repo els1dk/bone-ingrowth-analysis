@@ -1,0 +1,13 @@
+# Patient data — NEVER commit
+*.dcm
+DICOMDIR
+S0000001/
+data/
+
+# Python cruft
+__pycache__/
+*.pyc
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
