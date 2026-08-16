@@ -272,28 +272,64 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
         return BoneIngrowthAnalysisParameterNode(super().getParameterNode())
 
     def process(self,
-                inputVolume: vtkMRMLScalarVolumeNode,
-                cupSegmentation: vtkMRMLSegmentationNode,
-                boneThreshold: float,
-                metalThreshold: float) -> None:
-        """
-        Placeholder processing method. Will be replaced with real bone ingrowth
-        analysis logic in a later phase.
-        """
-        if not inputVolume or not cupSegmentation:
-            raise ValueError("Input volume or cup segmentation is invalid")
+                    inputVolume: vtkMRMLScalarVolumeNode,
+                    cupSegmentation: vtkMRMLSegmentationNode,
+                    boneThreshold: float,
+                    metalThreshold: float) -> None:
+            """
+            Identify the acetabular cup(s) within the metal segmentation using
+            connected-component analysis and shape-based filtering (z-extent and
+            voxel count), not hardcoded object ordering, per project brief.
+            Writes the result into a new segment called "CupOnly" so the original
+            full metal segmentation is not destroyed.
+            """
+            if not inputVolume or not cupSegmentation:
+                raise ValueError("Input volume or cup segmentation is invalid")
 
-        import time
-        startTime = time.time()
-        print("Processing started")
-        print(f"Input volume: {inputVolume.GetName()}")
-        print(f"Cup segmentation: {cupSegmentation.GetName()}")
-        print(f"Bone threshold: {boneThreshold}")
-        print(f"Metal threshold: {metalThreshold}")
-        stopTime = time.time()
-        print(f"Processing completed in {stopTime-startTime:.2f} seconds")
+            import numpy as np
+            import scipy.ndimage as ndi
+            import time
 
-#
+            startTime = time.time()
+            print("Processing started")
+
+            segmentation = cupSegmentation.GetSegmentation()
+            numSegments = segmentation.GetNumberOfSegments()
+            if numSegments == 0:
+                raise ValueError("No segments found in cup segmentation")
+            segmentId = segmentation.GetNthSegmentID(0)
+
+            segArray = slicer.util.arrayFromSegmentBinaryLabelmap(cupSegmentation, segmentId)
+            labeled, numComponents = ndi.label(segArray)
+            print(f"Found {numComponents} connected components in metal segmentation")
+
+            candidateCups = []
+            for i in range(1, numComponents + 1):
+                coords = np.argwhere(labeled == i)
+                voxelCount = coords.shape[0]
+                if voxelCount < 100:
+                    continue
+                bbox = coords.max(axis=0) - coords.min(axis=0)
+                zExtent = bbox[0]
+                print(f"  Component {i}: voxels={voxelCount}, zExtent={zExtent}")
+                if zExtent < 100 and voxelCount > 8000:
+                    candidateCups.append(i)
+
+            print(f"Candidate cup components: {candidateCups}")
+
+            if len(candidateCups) == 0:
+                raise ValueError("No cup-like components found - check thresholds")
+
+            cupOnlyArray = np.isin(labeled, candidateCups).astype(np.uint8)
+
+            cupSegmentId = segmentation.GetSegmentIdBySegmentName("CupOnly")
+            if not cupSegmentId:
+                cupSegmentId = segmentation.AddEmptySegment("CupOnly")
+            slicer.util.updateSegmentBinaryLabelmapFromArray(cupOnlyArray, cupSegmentation, cupSegmentId)
+
+            stopTime = time.time()
+            print(f"Processing completed in {stopTime-startTime:.2f} seconds")
+    #
 # BoneIngrowthAnalysisTest
 #
 
