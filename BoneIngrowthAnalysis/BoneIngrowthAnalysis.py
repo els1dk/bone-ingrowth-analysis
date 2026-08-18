@@ -264,17 +264,29 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
             cupSegmentId = segmentation.AddEmptySegment("CupOnly")
         slicer.util.updateSegmentBinaryLabelmapFromArray(cupOnlyArray, cupSegmentation, cupSegmentId)
 
-        self.identifyCupSurfaceZones(cupSegmentation)
+        self.cupRegions = self.identifyCupSurfaceZones(cupSegmentation)
 
+        bandThicknessMM = 3.0  # hardcoded for now; GUI slider comes next
+        for region in self.cupRegions:
+            band, boxBounds = self.computeAnalysisBandForCup(
+                inputVolume, cupSegmentation, region['center'], region['radius'],
+                region['boneFacingPoints'], bandThicknessMM)
+            region['analysisBand'] = band
+            region['analysisBandBoxBounds'] = boxBounds
+            print(f"Analysis band: {region['analysisBand'].sum()} voxels within {bandThicknessMM}mm")
         stopTime = time.time()
         print(f"Processing completed in {stopTime-startTime:.2f} seconds")
 
     def identifyCupSurfaceZones(self, cupSegmentation, alignmentThreshold=0.317):
         """
         For each connected cup component in the "CupOnly" segment, converts
-        it to a surface mesh, fits a sphere, and classifies each mesh point
-        as bone-facing or rim/opening based on direction alignment relative
-        to the sphere's true center (Section 6.2).
+        it to a surface mesh, computes point normals, separates the outer
+        (bone-facing) shell wall from the inner (liner-facing) shell wall
+        by comparing each point's normal to its radial direction from the
+        fitted sphere center, fits within the outer-wall points only, and
+        classifies those outer-wall points as bone-facing or rim/opening
+        based on direction alignment relative to the sphere's true center
+        (Section 6.2).
         """
         import numpy as np
 
@@ -289,8 +301,17 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
         polyData = vtk.vtkPolyData()
         cupSegmentation.GetClosedSurfaceRepresentation(cupSegmentId, polyData)
 
+        normalsFilter = vtk.vtkPolyDataNormals()
+        normalsFilter.SetInputData(polyData)
+        normalsFilter.ComputePointNormalsOn()
+        normalsFilter.ComputeCellNormalsOff()
+        normalsFilter.SplittingOff()
+        normalsFilter.ConsistencyOn()
+        normalsFilter.AutoOrientNormalsOn()
+        normalsFilter.Update()
+
         connectivityFilter = vtk.vtkPolyDataConnectivityFilter()
-        connectivityFilter.SetInputData(polyData)
+        connectivityFilter.SetInputData(normalsFilter.GetOutput())
         connectivityFilter.SetExtractionModeToAllRegions()
         connectivityFilter.ColorRegionsOn()
         connectivityFilter.Update()
@@ -303,22 +324,36 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
         regionIds = np.array([regionArray.GetValue(i) for i in range(regionArray.GetNumberOfTuples())])
         allPoints = np.array([labeledPolyData.GetPoint(i) for i in range(labeledPolyData.GetNumberOfPoints())])
 
+        normalsVTKArray = labeledPolyData.GetPointData().GetNormals()
+        allNormals = np.array([normalsVTKArray.GetTuple(i) for i in range(normalsVTKArray.GetNumberOfTuples())])
+
         results = []
         for regionIndex in range(numRegions):
-            regionPoints = allPoints[regionIds == regionIndex]
+            regionMask = regionIds == regionIndex
+            regionPoints = allPoints[regionMask]
+            regionNormals = allNormals[regionMask]
             if regionPoints.shape[0] < 50:
                 continue
 
             center, radius = self.fitSphere(regionPoints)
 
-            directions = (regionPoints - center) / radius
-            meanDirection = directions.mean(axis=0)
+            radialDirections = (regionPoints - center) / radius
+            outwardnessScore = np.sum(regionNormals * radialDirections, axis=1)
+            outerWallMask = outwardnessScore > 0
+
+            print(f"Region {regionIndex}: {outerWallMask.sum()} outer-wall points, "
+                  f"{(~outerWallMask).sum()} inner-wall points (of {regionPoints.shape[0]} total)")
+
+            outerPoints = regionPoints[outerWallMask]
+            outerDirections = radialDirections[outerWallMask]
+
+            meanDirection = outerDirections.mean(axis=0)
             meanDirection = meanDirection / np.linalg.norm(meanDirection)
-            alignmentScore = np.dot(directions, meanDirection)
+            alignmentScore = np.dot(outerDirections, meanDirection)
 
             boneFacingMask = alignmentScore > alignmentThreshold
-            boneFacingPoints = regionPoints[boneFacingMask]
-            rimPoints = regionPoints[~boneFacingMask]
+            boneFacingPoints = outerPoints[boneFacingMask]
+            rimPoints = outerPoints[~boneFacingMask]
 
             print(f"Cup region {regionIndex}: radius={radius:.2f}mm, "
                   f"bone-facing={boneFacingPoints.shape[0]}, rim={rimPoints.shape[0]}")
@@ -334,7 +369,6 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
             })
 
         return results
-
     @staticmethod
     def fitSphere(points):
         """Least-squares fit of a sphere to a set of 3D points. Returns (center, radius)."""
@@ -370,8 +404,165 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
         node.GetDisplayNode().SetVisibility(True)
         return node
 
+    
+    @staticmethod
+    def rasPointsToIJK(volumeNode, rasPoints):
+        """
+        Converts an Nx3 array of RAS (world, mm) points into an Nx3 array
+        of integer IJK voxel indices on the given volume's grid. Output
+        columns are ordered (i, j, k) -- i.e. (column, row, slice) -- to
+        match the volume's IJK convention, NOT numpy's array axis order.
+        Continuous IJK coordinates are rounded to the nearest voxel.
+        """
+        import numpy as np
+        ijkMatrixVTK = vtk.vtkMatrix4x4()
+        volumeNode.GetRASToIJKMatrix(ijkMatrixVTK)
+        rasToIJK = np.array([[ijkMatrixVTK.GetElement(row, col) for col in range(4)]
+                              for row in range(4)])
+        numPoints = rasPoints.shape[0]
+        rasHomogeneous = np.hstack([rasPoints, np.ones((numPoints, 1))])
+        ijkHomogeneous = rasHomogeneous @ rasToIJK.T
+        ijkContinuous = ijkHomogeneous[:, :3]
+        ijkIndices = np.round(ijkContinuous).astype(int)
+        return ijkIndices
 
+    
+    @staticmethod
+    def buildBinaryMaskFromIJK(volumeNode, ijkIndices):
+        """
+        Builds a boolean numpy array, shaped like the volume's own voxel
+        array (numpy (K, J, I) order -- slice, row, column), with True at
+        each voxel corresponding to a given (i, j, k) index. Multiple
+        input points may map to the same voxel (mesh points are finer
+        than voxel resolution) -- that's expected and fine.
+        """
+        import numpy as np
+
+        volumeArray = slicer.util.arrayFromVolume(volumeNode)
+        shape = volumeArray.shape  # (K, J, I)
+
+        iIdx = np.clip(ijkIndices[:, 0], 0, shape[2] - 1)
+        jIdx = np.clip(ijkIndices[:, 1], 0, shape[1] - 1)
+        kIdx = np.clip(ijkIndices[:, 2], 0, shape[0] - 1)
+
+        mask = np.zeros(shape, dtype=bool)
+        mask[kIdx, jIdx, iIdx] = True
+        return mask
+
+    @staticmethod
+    def computeDistanceFromSurfaceMM(volumeNode, mask):
+        """
+        Computes, for every voxel in the volume, the physical distance (mm)
+        to the nearest True voxel in `mask`. Surface voxels themselves get
+        distance 0. Uses the volume's own voxel spacing so the result is
+        genuine millimeters, not voxel counts.
+        """
+        import numpy as np
+        import scipy.ndimage as ndi
+
+        spacingIJK = volumeNode.GetSpacing()  # (spacing_i, spacing_j, spacing_k)
+        samplingKJI = (spacingIJK[2], spacingIJK[1], spacingIJK[0])  # match mask's (K,J,I) axis order
+
+        distanceMM = ndi.distance_transform_edt(~mask, sampling=samplingKJI)
+        return distanceMM
+    @staticmethod
+    def computeAnalysisBand(distanceMM, metalMask, bandThicknessMM):
+        """
+        Returns a boolean mask of voxels within `bandThicknessMM` mm of the
+        bone-facing surface, with metal-implant voxels excluded. Excluding
+        the metal keeps the band on the outward (bone-facing) side of the
+        surface rather than growing in both directions, satisfying the
+        spec's requirement that the band extend "outward from the cup
+        surface in the direction of the bone."
+        """
+        import numpy as np
+        withinDistance = distanceMM <= bandThicknessMM
+        notMetal = ~(metalMask.astype(bool))
+        band = withinDistance & notMetal
+        return band
+    def computeAnalysisBandForCup(self, volumeNode, cupSegmentation, cupCenter, cupRadius,
+                                   boneFacingPointsRAS, bandThicknessMM, safetyMarginMM=5.0):
+        """
+        Given one cup's fitted-sphere center/radius and bone-facing RAS
+        points, builds the millimeter-thick analysis band (Section 6.3),
+        restricted to a small bounding box around the cup instead of the
+        full CT volume, for speed. The box margin covers the cup radius
+        (so the surface points themselves are never clipped) plus the
+        band thickness plus a small safety margin.
+        """
+        segmentation = cupSegmentation.GetSegmentation()
+        cupSegmentId = segmentation.GetSegmentIdBySegmentName("CupOnly")
+        if not cupSegmentId and segmentation.GetSegment("CupOnly"):
+            cupSegmentId = "CupOnly"
+
+        metalMaskFull = slicer.util.arrayFromSegmentBinaryLabelmap(cupSegmentation, cupSegmentId)
+
+        boxMarginMM = cupRadius + bandThicknessMM + safetyMarginMM
+        boxBounds = self.computeCupBoundingBoxIJK(volumeNode, cupCenter, boxMarginMM)
+        iMin, iMax, jMin, jMax, kMin, kMax = boxBounds
+
+        metalMaskCropped = metalMaskFull[kMin:kMax + 1, jMin:jMax + 1, iMin:iMax + 1]
+
+        ijk = self.rasPointsToIJK(volumeNode, boneFacingPointsRAS)
+        surfaceMask = self.buildLocalBinaryMask(ijk, boxBounds)
+
+        distanceMM = self.computeDistanceFromSurfaceMM(volumeNode, surfaceMask)
+        band = self.computeAnalysisBand(distanceMM, metalMaskCropped, bandThicknessMM)
+
+        return band, boxBounds
+    def computeCupBoundingBoxIJK(self, volumeNode, center, marginMM):
+        """
+        Computes an axis-aligned IJK bounding box around a physical RAS
+        point (the cup's fitted sphere center), extending marginMM in
+        every direction, clipped to the volume's actual dimensions.
+        Returns (iMin, iMax, jMin, jMax, kMin, kMax) as integer voxel
+        indices.
+        """
+        import numpy as np
+
+        cornersRAS = np.array([
+            [center[0] + di, center[1] + dj, center[2] + dk]
+            for di in (-marginMM, marginMM)
+            for dj in (-marginMM, marginMM)
+            for dk in (-marginMM, marginMM)
+        ])
+
+        ijkCorners = self.rasPointsToIJK(volumeNode, cornersRAS)
+
+        volumeArray = slicer.util.arrayFromVolume(volumeNode)
+        shape = volumeArray.shape  # (K, J, I)
+
+        iMin = max(0, int(ijkCorners[:, 0].min()))
+        iMax = min(shape[2] - 1, int(ijkCorners[:, 0].max()))
+        jMin = max(0, int(ijkCorners[:, 1].min()))
+        jMax = min(shape[1] - 1, int(ijkCorners[:, 1].max()))
+        kMin = max(0, int(ijkCorners[:, 2].min()))
+        kMax = min(shape[0] - 1, int(ijkCorners[:, 2].max()))
+
+        return (iMin, iMax, jMin, jMax, kMin, kMax)
+    @staticmethod
+    def buildLocalBinaryMask(ijkIndices, boxBounds):
+        """
+        Builds a small boolean mask covering only the cropped region
+        defined by boxBounds = (iMin, iMax, jMin, jMax, kMin, kMax),
+        instead of the full volume. ijkIndices are GLOBAL (i, j, k) voxel
+        indices; they get translated into LOCAL indices relative to the
+        box's minimum corner before being stamped into the mask.
+        """
+        import numpy as np
+
+        iMin, iMax, jMin, jMax, kMin, kMax = boxBounds
+        localShape = (kMax - kMin + 1, jMax - jMin + 1, iMax - iMin + 1)
+
+        iLocal = np.clip(ijkIndices[:, 0] - iMin, 0, localShape[2] - 1)
+        jLocal = np.clip(ijkIndices[:, 1] - jMin, 0, localShape[1] - 1)
+        kLocal = np.clip(ijkIndices[:, 2] - kMin, 0, localShape[0] - 1)
+
+        mask = np.zeros(localShape, dtype=bool)
+        mask[kLocal, jLocal, iLocal] = True
+        return mask
 #
+
 # BoneIngrowthAnalysisTest
 #
 
