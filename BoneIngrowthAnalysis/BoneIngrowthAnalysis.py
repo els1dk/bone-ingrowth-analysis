@@ -95,7 +95,7 @@ class BoneIngrowthAnalysisParameterNode:
     cupSegmentation: vtkMRMLSegmentationNode
     boneThreshold: Annotated[float, WithinRange(-1000, 3000)] = 300
     metalThreshold: Annotated[float, WithinRange(0, 5000)] = 2500
-
+    bandThicknessMM: Annotated[float, WithinRange(1.0, 5.0)] = 3.0
 
 #
 # BoneIngrowthAnalysisWidget
@@ -186,6 +186,7 @@ class BoneIngrowthAnalysisWidget(ScriptedLoadableModuleWidget, VTKObservationMix
                 self._parameterNode.cupSegmentation,
                 self._parameterNode.boneThreshold,
                 self._parameterNode.metalThreshold,
+                self._parameterNode.bandThicknessMM,
             )
 
 
@@ -211,7 +212,8 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
                 inputVolume: vtkMRMLScalarVolumeNode,
                 cupSegmentation: vtkMRMLSegmentationNode,
                 boneThreshold: float,
-                metalThreshold: float) -> None:
+                metalThreshold: float,
+                bandThicknessMM: float) -> None:
         """
         Identify the acetabular cup(s) within the metal segmentation using
         connected-component analysis and shape-based filtering (z-extent and
@@ -266,7 +268,7 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
 
         self.cupRegions = self.identifyCupSurfaceZones(cupSegmentation)
 
-        bandThicknessMM = 3.0  # hardcoded for now; GUI slider comes next
+       
         for region in self.cupRegions:
             band, boxBounds = self.computeAnalysisBandForCup(
                 inputVolume, cupSegmentation, region['center'], region['radius'],

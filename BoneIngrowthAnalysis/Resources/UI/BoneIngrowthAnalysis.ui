@@ -77,14 +77,14 @@
         </property>
        </widget>
       </item>
-      <item row="4" column="0">
+      <item row="5" column="0">
        <widget class="QLabel" name="label_6">
         <property name="text">
          <string>Cup segmentation:</string>
         </property>
        </widget>
       </item>
-      <item row="4" column="1">
+      <item row="5" column="1">
        <widget class="qMRMLNodeComboBox" name="cupSegmentationSelector">
         <property name="enabled">
          <bool>true</bool>
@@ -122,6 +122,32 @@
        <widget class="QLabel" name="label_7">
         <property name="text">
          <string>Metal threshold:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="0">
+       <widget class="QLabel" name="bandThicknessMMLabel">
+        <property name="text">
+         <string>Band thickness (mm):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="1">
+       <widget class="ctkSliderWidget" name="bandThicknessMMSliderWidget">
+        <property name="decimals">
+         <number>1</number>
+        </property>
+        <property name="minimum">
+         <double>1.000000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>5.000000000000000</double>
+        </property>
+        <property name="value">
+         <double>3.000000000000000</double>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>bandThicknessMM</string>
         </property>
        </widget>
       </item>
