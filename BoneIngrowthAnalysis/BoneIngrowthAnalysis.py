@@ -270,12 +270,20 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
 
        
         for region in self.cupRegions:
-            band, boxBounds = self.computeAnalysisBandForCup(
+            band, boxBounds, metalMaskCropped = self.computeAnalysisBandForCup(
                 inputVolume, cupSegmentation, region['center'], region['radius'],
                 region['boneFacingPoints'], bandThicknessMM)
             region['analysisBand'] = band
             region['analysisBandBoxBounds'] = boxBounds
             print(f"Analysis band: {region['analysisBand'].sum()} voxels within {bandThicknessMM}mm")
+            classification = self.classifyBandVoxels(
+                inputVolume, band, boneThreshold=boneThreshold, boxBounds=boxBounds, metalMaskCropped=metalMaskCropped, uncertainDistanceMM=1.0)
+            region['classification'] = classification
+            boneCount = int(np.sum(classification == 1))
+            nonBoneCount = int(np.sum(classification == 2))
+            uncertainCount = int(np.sum(classification == 3))
+            print(f"Bone classification: {boneCount} probable bone, {nonBoneCount} probable non-bone "
+                  f"{uncertainCount} uncertain (threshold={boneThreshold} HU)")
         stopTime = time.time()
         print(f"Processing completed in {stopTime-startTime:.2f} seconds")
 
@@ -511,7 +519,36 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
         distanceMM = self.computeDistanceFromSurfaceMM(volumeNode, surfaceMask)
         band = self.computeAnalysisBand(distanceMM, metalMaskCropped, bandThicknessMM)
 
-        return band, boxBounds
+        return band, boxBounds, metalMaskCropped
+
+    def classifyBandVoxels(self, volumeNode, bandMask, boneThreshold, boxBounds, metalMaskCropped, uncertainDistanceMM=1.0):
+        """
+        Section 6.4: classifies each voxel inside the analysis band as
+        probable bone or probable non-bone, using a simple adjustable HU
+        threshold. Returns a small labeled array, same shape as `band`:
+          0 = outside the band (not evaluated)
+          1 = probable bone       (HU >= boneThreshold)
+          2 = probable non-bone   (HU <  boneThreshold)
+        """ 
+
+        import numpy as np
+
+        volumeArray = slicer.util.arrayFromVolume(volumeNode)
+        iMin, iMax, jMin, jMax, kMin, kMax = boxBounds
+        ctSubArray = volumeArray[kMin:kMax + 1, jMin:jMax + 1, iMin:iMax + 1]
+    
+        distanceFromMetalMM = self.computeDistanceFromSurfaceMM(volumeNode, metalMaskCropped.astype(bool))
+        nearMetal = distanceFromMetalMM < uncertainDistanceMM
+        classification = np.zeros(bandMask.shape, dtype=np.uint8)
+        boneMask = (ctSubArray >= boneThreshold) & bandMask
+        nonBoneMask = (ctSubArray < boneThreshold) & bandMask
+        uncertainMask = nearMetal & bandMask
+
+        classification[boneMask] = 1
+        classification[nonBoneMask] = 2
+        classification[uncertainMask] = 3
+
+        return classification
     def computeCupBoundingBoxIJK(self, volumeNode, center, marginMM):
         """
         Computes an axis-aligned IJK bounding box around a physical RAS
