@@ -242,16 +242,20 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
         labeled, numComponents = ndi.label(segArray)
         print(f"Found {numComponents} connected components in metal segmentation")
 
+        MIN_COMPONENT_VOXELS = 100      # below this, treat as segmentation noise, not a real anatomical structure
+        MAX_CUP_Z_EXTENT = 100          # cups are roughly hemispherical (~50 voxels tall); stems/shafts are much taller
+        MIN_CUP_VOXELS = 8000           # tuned against this dataset's two cups (~12-14k voxels each) vs. everything else
+
         candidateCups = []
         for i in range(1, numComponents + 1):
             coords = np.argwhere(labeled == i)
             voxelCount = coords.shape[0]
-            if voxelCount < 100:
+            if voxelCount < MIN_COMPONENT_VOXELS:
                 continue
             bbox = coords.max(axis=0) - coords.min(axis=0)
             zExtent = bbox[0]
             print(f"  Component {i}: voxels={voxelCount}, zExtent={zExtent}")
-            if zExtent < 100 and voxelCount > 8000:
+            if zExtent < MAX_CUP_Z_EXTENT and voxelCount > MIN_CUP_VOXELS:
                 candidateCups.append(i)
 
         print(f"Candidate cup components: {candidateCups}")
@@ -284,6 +288,12 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
             uncertainCount = int(np.sum(classification == 3))
             print(f"Bone classification: {boneCount} probable bone, {nonBoneCount} probable non-bone "
                   f"{uncertainCount} uncertain (threshold={boneThreshold} HU)")
+            coverage = self.computeSurfaceCoverage(inputVolume, region, boxBounds, bandThicknessMM)
+            region['coverage'] = coverage
+            print(f"Surface coverage: {coverage['totalEvaluableAreaMM2']:.1f}mm^2 evaluable, "
+                  f"{coverage['boneAreaMM2']:.1f}mm^2 bone ({coverage['bonePercent']:.1f}%), "
+                  f"{coverage['nonBoneAreaMM2']:.1f}mm^2 non-bone, "
+                  f"{coverage['uncertainAreaMM2']:.1f}mm^2 uncertain ({coverage['uncertainPercent']:.1f}%)")
         stopTime = time.time()
         print(f"Processing completed in {stopTime-startTime:.2f} seconds")
 
@@ -337,6 +347,12 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
         normalsVTKArray = labeledPolyData.GetPointData().GetNormals()
         allNormals = np.array([normalsVTKArray.GetTuple(i) for i in range(normalsVTKArray.GetNumberOfTuples())])
 
+        massProps = vtk.vtkMassProperties()
+        massProps.SetInputData(normalsFilter.GetOutput())
+        massProps.Update()
+        totalSurfaceAreaMM2 = massProps.GetSurfaceArea()
+        pointAreaMM2 = totalSurfaceAreaMM2 / labeledPolyData.GetNumberOfPoints()
+
         results = []
         for regionIndex in range(numRegions):
             regionMask = regionIds == regionIndex
@@ -376,9 +392,74 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
                 'radius': radius,
                 'boneFacingPoints': boneFacingPoints,
                 'rimPoints': rimPoints,
+                'pointAreaMM2': pointAreaMM2,
             })
 
         return results
+    def computeSurfaceCoverage(self, volumeNode, region, boxBounds, bandThicknessMM, samplesPerRay=4):
+        """
+        Section 6.5: classifies each bone-facing SURFACE POINT (not each
+        band voxel) as bone-covered, non-bone-covered, or uncertain, by
+        sampling several points outward along that point's radial direction
+        (out to bandThicknessMM) and reading the Section 6.4 per-voxel
+        classification at each sample. A point's label is whichever
+        category appears most among its samples, ties/leads going to
+        "uncertain" (the conservative choice). Coverage is then reported
+        as SURFACE AREA (mm^2), not voxel count -- a thicker band contains
+        more voxels but shouldn't by itself inflate the bone-covered area.
+        """
+        import numpy as np
+
+        boneFacingPoints = region['boneFacingPoints']
+        center = region['center']
+        radius = region['radius']
+        classification = region['classification']
+        pointAreaMM2 = region['pointAreaMM2']
+        iMin, iMax, jMin, jMax, kMin, kMax = boxBounds
+
+        sampleDistances = np.linspace(0, bandThicknessMM, samplesPerRay, endpoint=True)
+        pointLabels = np.zeros(boneFacingPoints.shape[0], dtype=np.uint8)
+
+        for pointIndex, surfacePoint in enumerate(boneFacingPoints):
+            direction = (surfacePoint - center) / radius             # same outward-radial approximation
+                                                                       # already used for bone-facing/rim in 6.2
+            rayPointsRAS = surfacePoint + sampleDistances[:, None] * direction
+            rayIJK = self.rasPointsToIJK(volumeNode, rayPointsRAS)    # global voxel indices, one per sample
+
+            labelsAlongRay = []
+            for i, j, k in rayIJK:
+                iLocal, jLocal, kLocal = i - iMin, j - jMin, k - kMin
+                if (0 <= iLocal < classification.shape[2] and
+                        0 <= jLocal < classification.shape[1] and
+                        0 <= kLocal < classification.shape[0]):
+                    label = classification[kLocal, jLocal, iLocal]
+                    if label != 0:                                    # skip samples that landed outside the band
+                        labelsAlongRay.append(label)
+
+            if len(labelsAlongRay) == 0:
+                pointLabels[pointIndex] = 0                           # nothing evaluable along this ray
+            else:
+                counts = np.bincount(labelsAlongRay, minlength=4)
+                if counts[3] >= max(counts[1], counts[2]):
+                    pointLabels[pointIndex] = 3
+                elif counts[1] >= counts[2]:
+                    pointLabels[pointIndex] = 1
+                else:
+                    pointLabels[pointIndex] = 2
+
+        evaluableCount = int(np.sum(pointLabels != 0))
+        boneCount = int(np.sum(pointLabels == 1))
+        nonBoneCount = int(np.sum(pointLabels == 2))
+        uncertainCount = int(np.sum(pointLabels == 3))
+
+        return {
+            'totalEvaluableAreaMM2': evaluableCount * pointAreaMM2,
+            'boneAreaMM2': boneCount * pointAreaMM2,
+            'nonBoneAreaMM2': nonBoneCount * pointAreaMM2,
+            'uncertainAreaMM2': uncertainCount * pointAreaMM2,
+            'bonePercent': 100.0 * boneCount / evaluableCount if evaluableCount else 0.0,
+            'uncertainPercent': 100.0 * uncertainCount / evaluableCount if evaluableCount else 0.0,
+        }
     @staticmethod
     def fitSphere(points):
         """Least-squares fit of a sphere to a set of 3D points. Returns (center, radius)."""
