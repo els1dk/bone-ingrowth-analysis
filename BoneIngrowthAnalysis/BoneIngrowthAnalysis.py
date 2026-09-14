@@ -96,6 +96,8 @@ class BoneIngrowthAnalysisParameterNode:
     boneThreshold: Annotated[float, WithinRange(-1000, 3000)] = 300
     metalThreshold: Annotated[float, WithinRange(0, 5000)] = 2500
     bandThicknessMM: Annotated[float, WithinRange(1.0, 5.0)] = 3.0
+    uncertainDistanceMM: Annotated[float, WithinRange(0.7, 5.0)] = 1.0
+    minBoneComponentVoxels: Annotated[int, WithinRange(1, 500)] = 20
 
 #
 # BoneIngrowthAnalysisWidget
@@ -187,6 +189,8 @@ class BoneIngrowthAnalysisWidget(ScriptedLoadableModuleWidget, VTKObservationMix
                 self._parameterNode.boneThreshold,
                 self._parameterNode.metalThreshold,
                 self._parameterNode.bandThicknessMM,
+                self._parameterNode.uncertainDistanceMM,
+                self._parameterNode.minBoneComponentVoxels,
             )
 
 
@@ -213,7 +217,9 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
                 cupSegmentation: vtkMRMLSegmentationNode,
                 boneThreshold: float,
                 metalThreshold: float,
-                bandThicknessMM: float) -> None:
+                bandThicknessMM: float,
+                uncertainDistanceMM: float,
+                minBoneComponentVoxels: int) -> None:
         """
         Identify the acetabular cup(s) within the metal segmentation using
         connected-component analysis and shape-based filtering (z-extent and
@@ -274,14 +280,14 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
 
        
         for region in self.cupRegions:
-            band, boxBounds, metalMaskCropped = self.computeAnalysisBandForCup(
+            band, boxBounds, metalMaskCropped, distanceMM = self.computeAnalysisBandForCup(
                 inputVolume, cupSegmentation, region['center'], region['radius'],
                 region['boneFacingPoints'], bandThicknessMM)
             region['analysisBand'] = band
             region['analysisBandBoxBounds'] = boxBounds
             print(f"Analysis band: {region['analysisBand'].sum()} voxels within {bandThicknessMM}mm")
             classification = self.classifyBandVoxels(
-                inputVolume, band, boneThreshold=boneThreshold, boxBounds=boxBounds, metalMaskCropped=metalMaskCropped, uncertainDistanceMM=1.0)
+                inputVolume, band, boneThreshold=boneThreshold, boxBounds=boxBounds, metalMaskCropped=metalMaskCropped, uncertainDistanceMM=uncertainDistanceMM)
             region['classification'] = classification
             boneCount = int(np.sum(classification == 1))
             nonBoneCount = int(np.sum(classification == 2))
@@ -294,6 +300,14 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
                   f"{coverage['boneAreaMM2']:.1f}mm^2 bone ({coverage['bonePercent']:.1f}%), "
                   f"{coverage['nonBoneAreaMM2']:.1f}mm^2 non-bone, "
                   f"{coverage['uncertainAreaMM2']:.1f}mm^2 uncertain ({coverage['uncertainPercent']:.1f}%)")
+
+            connectivity = self.computeBoneConnectivity(inputVolume, region, boxBounds, distanceMM, bandThicknessMM, minComponentVoxels=minBoneComponentVoxels)
+            region['connectivity'] = connectivity
+            print(f"Bone connectivity: {connectivity['connectedPercent']:.1f}% connected to bone stock, "
+                  f"{connectivity['isolatedShellPercent']:.1f}% isolated thin shell, "
+                  f"{connectivity['gapButBoneFurtherOutPercent']:.1f}% gap-but-bone-further-out, "
+                  f"{connectivity['noBonePercent']:.1f}% no bone found "
+                  f"(direct coverage total: {connectivity['directCoveragePercent']:.1f}%)")
         stopTime = time.time()
         print(f"Processing completed in {stopTime-startTime:.2f} seconds")
 
@@ -353,6 +367,11 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
         totalSurfaceAreaMM2 = massProps.GetSurfaceArea()
         pointAreaMM2 = totalSurfaceAreaMM2 / labeledPolyData.GetNumberOfPoints()
 
+        # World-space glyph radius for the debug point-cloud models below,
+        # derived from actual mesh point density (see createPointCloudModel) --
+        # not a fixed screen-space size, so coverage looks solid at any zoom.
+        glyphRadiusMM = 1.3 * np.sqrt(pointAreaMM2 / np.pi)
+
         results = []
         for regionIndex in range(numRegions):
             regionMask = regionIds == regionIndex
@@ -384,8 +403,8 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
             print(f"Cup region {regionIndex}: radius={radius:.2f}mm, "
                   f"bone-facing={boneFacingPoints.shape[0]}, rim={rimPoints.shape[0]}")
 
-            self.createPointCloudModel(boneFacingPoints, f"BoneFacing_Cup{regionIndex}", (1, 0, 0))
-            self.createPointCloudModel(rimPoints, f"Rim_Cup{regionIndex}", (0, 0, 1))
+            self.createPointCloudModel(boneFacingPoints, f"BoneFacing_Cup{regionIndex}", (1, 0, 0), glyphRadiusMM)
+            self.createPointCloudModel(rimPoints, f"Rim_Cup{regionIndex}", (0, 0, 1), glyphRadiusMM)
 
             results.append({
                 'center': center,
@@ -460,6 +479,109 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
             'bonePercent': 100.0 * boneCount / evaluableCount if evaluableCount else 0.0,
             'uncertainPercent': 100.0 * uncertainCount / evaluableCount if evaluableCount else 0.0,
         }
+
+    def computeBoneConnectivity(self, volumeNode, region, boxBounds, distanceMM, bandThicknessMM,
+                                 samplesPerRay=4, minComponentVoxels=20, outerBandFraction=0.75):
+        """
+        Section 6.6: for each bone-facing surface point, determines not just
+        WHETHER bone-density voxels are present next to the cup (already known
+        from 6.4/6.5), but whether that bone is actually continuously connected
+        to the more distant bone stock, or is an isolated island at the implant
+        interface. Categorizes each point into one of:
+          1 'connected'           - bone right at the surface, in a component
+                                     that reaches the outer edge of the band
+                                     (plausibly continuous with real bone
+                                     stock beyond the band)
+          2 'isolatedShell'       - bone right at the surface, but confined to
+                                     a component that never reaches the outer
+                                     band -- a thin isolated shell, not
+                                     evidence of real ingrowth
+          3 'gapButBoneFurtherOut'- no bone right at the surface, but a
+                                     (non-tiny) bone component is found
+                                     farther out along the same ray
+          0 'noBone'              - no valid bone component found anywhere
+                                     along the ray
+        Components smaller than minComponentVoxels are excluded from counting
+        as real bone (per spec: "exclude very thin or small-volume bone
+        islands"). "Reaching the outer band" is approximated as having at
+        least one voxel within the outer outerBandFraction of the band's
+        thickness (default: outer 25%).
+        """
+        import numpy as np
+        import scipy.ndimage as ndi
+
+        boneFacingPoints = region['boneFacingPoints']
+        center = region['center']
+        radius = region['radius']
+        classification = region['classification']
+        pointAreaMM2 = region['pointAreaMM2']
+        iMin, iMax, jMin, jMax, kMin, kMax = boxBounds
+
+        boneMask = (classification == 1)
+        labeledBone, numBoneComponents = ndi.label(boneMask)
+
+        outerBandMask = boneMask & (distanceMM >= outerBandFraction * bandThicknessMM)
+
+        validReachesOuter = {}
+        for label in range(1, numBoneComponents + 1):
+            componentMask = labeledBone == label
+            if componentMask.sum() < minComponentVoxels:
+                continue
+            validReachesOuter[label] = bool(np.any(outerBandMask & componentMask))
+
+        sampleDistances = np.linspace(0, bandThicknessMM, samplesPerRay, endpoint=True)
+        nearSampleCount = max(1, samplesPerRay // 2)
+
+        pointCategories = np.zeros(boneFacingPoints.shape[0], dtype=np.uint8)
+
+        for pointIndex, surfacePoint in enumerate(boneFacingPoints):
+            direction = (surfacePoint - center) / radius
+            rayPointsRAS = surfacePoint + sampleDistances[:, None] * direction
+            rayIJK = self.rasPointsToIJK(volumeNode, rayPointsRAS)
+
+            nearBoneLabel = None
+            farBoneFound = False
+            for sampleIndex, (i, j, k) in enumerate(rayIJK):
+                iLocal, jLocal, kLocal = i - iMin, j - jMin, k - kMin
+                if not (0 <= iLocal < labeledBone.shape[2] and
+                        0 <= jLocal < labeledBone.shape[1] and
+                        0 <= kLocal < labeledBone.shape[0]):
+                    continue
+                label = labeledBone[kLocal, jLocal, iLocal]
+                if label == 0 or label not in validReachesOuter:
+                    continue
+                if sampleIndex < nearSampleCount:
+                    if nearBoneLabel is None:
+                        nearBoneLabel = label
+                else:
+                    farBoneFound = True
+
+            if nearBoneLabel is not None:
+                pointCategories[pointIndex] = 1 if validReachesOuter[nearBoneLabel] else 2
+            elif farBoneFound:
+                pointCategories[pointIndex] = 3
+            else:
+                pointCategories[pointIndex] = 0
+
+        connectedCount = int(np.sum(pointCategories == 1))
+        isolatedCount = int(np.sum(pointCategories == 2))
+        gapCount = int(np.sum(pointCategories == 3))
+        noBoneCount = int(np.sum(pointCategories == 0))
+        totalPoints = boneFacingPoints.shape[0]
+
+        return {
+            'directCoverageAreaMM2': (connectedCount + isolatedCount) * pointAreaMM2,
+            'connectedAreaMM2': connectedCount * pointAreaMM2,
+            'isolatedShellAreaMM2': isolatedCount * pointAreaMM2,
+            'gapButBoneFurtherOutAreaMM2': gapCount * pointAreaMM2,
+            'noBoneAreaMM2': noBoneCount * pointAreaMM2,
+            'directCoveragePercent': 100.0 * (connectedCount + isolatedCount) / totalPoints if totalPoints else 0.0,
+            'connectedPercent': 100.0 * connectedCount / totalPoints if totalPoints else 0.0,
+            'isolatedShellPercent': 100.0 * isolatedCount / totalPoints if totalPoints else 0.0,
+            'gapButBoneFurtherOutPercent': 100.0 * gapCount / totalPoints if totalPoints else 0.0,
+            'noBonePercent': 100.0 * noBoneCount / totalPoints if totalPoints else 0.0,
+        }
+
     @staticmethod
     def fitSphere(points):
         """Least-squares fit of a sphere to a set of 3D points. Returns (center, radius)."""
@@ -472,15 +594,38 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
         return center, radius
 
     @staticmethod
-    def createPointCloudModel(pointsArray, name, color):
-        """Creates a visible point-cloud model node from a numpy array of 3D points."""
+    def createPointCloudModel(pointsArray, name, color, glyphRadiusMM=1.0):
+        """
+        Creates a visible model node from a numpy array of 3D points, glyphing
+        each point with a small sphere sized in WORLD units (mm) rather than
+        rendering bare vertices with a fixed screen-space point size.
+
+        The previous implementation used vtkVertexGlyphFilter with
+        SetPointSize(4) -- 4 SCREEN PIXELS, not 4mm. Each point's real-world
+        spacing stayed fixed while the camera zoom changed, so at close zoom
+        the same points covered fewer screen pixels and the gaps between them
+        widened, producing a speckled/"holey" look that had nothing to do with
+        the underlying segmentation data (every classified point was always
+        present in the array -- see identifyCupSurfaceZones). Sizing the glyph
+        in mm, scaled to the mesh's own local point density (pointAreaMM2),
+        keeps adjacent glyphs overlapping and the surface looking solid
+        regardless of how far in the camera zooms.
+        """
         vtkPoints = vtk.vtkPoints()
         for p in pointsArray:
             vtkPoints.InsertNextPoint(p)
         poly = vtk.vtkPolyData()
         poly.SetPoints(vtkPoints)
-        glyphFilter = vtk.vtkVertexGlyphFilter()
+
+        sphereSource = vtk.vtkSphereSource()
+        sphereSource.SetRadius(glyphRadiusMM)
+        sphereSource.SetThetaResolution(6)
+        sphereSource.SetPhiResolution(6)
+
+        glyphFilter = vtk.vtkGlyph3D()
+        glyphFilter.SetSourceConnection(sphereSource.GetOutputPort())
         glyphFilter.SetInputData(poly)
+        glyphFilter.ScalingOff()
         glyphFilter.Update()
 
         existing = slicer.mrmlScene.GetFirstNodeByName(name)
@@ -491,7 +636,6 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
         node.SetAndObservePolyData(glyphFilter.GetOutput())
         node.CreateDefaultDisplayNodes()
         node.GetDisplayNode().SetColor(*color)
-        node.GetDisplayNode().SetPointSize(4)
         node.GetDisplayNode().SetVisibility(True)
         return node
 
@@ -600,7 +744,7 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
         distanceMM = self.computeDistanceFromSurfaceMM(volumeNode, surfaceMask)
         band = self.computeAnalysisBand(distanceMM, metalMaskCropped, bandThicknessMM)
 
-        return band, boxBounds, metalMaskCropped
+        return band, boxBounds, metalMaskCropped, distanceMM
 
     def classifyBandVoxels(self, volumeNode, bandMask, boneThreshold, boxBounds, metalMaskCropped, uncertainDistanceMM=1.0):
         """
@@ -681,7 +825,6 @@ class BoneIngrowthAnalysisLogic(ScriptedLoadableModuleLogic):
         mask = np.zeros(localShape, dtype=bool)
         mask[kLocal, jLocal, iLocal] = True
         return mask
-#
 
 # BoneIngrowthAnalysisTest
 #
